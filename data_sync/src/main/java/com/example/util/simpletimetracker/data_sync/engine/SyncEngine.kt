@@ -130,28 +130,44 @@ class SyncEngine @Inject constructor(
 
     private val syncMutex = Mutex()
 
+    @Volatile
+    private var hasPendingSyncRequest = false
+
+    @Volatile
+    var isPulling: Boolean = false
+        private set
+
     suspend fun syncNow() {
         if (!credentialStore.isConfigured) {
             _status.value = SyncStatus.NOT_CONFIGURED
             return
         }
         // Only one sync may run at a time: overlapping runs could cancel each
-        // other mid apply and leave partially imported data behind. A skipped
-        // run is fine, the next trigger (debounce, worker or manual) syncs.
+        // other mid apply and leave partially imported data behind.
+        // If a sync is already running, remember that a new sync was requested
+        // so it immediately runs a follow-up sync to catch changes made in-flight.
         if (!syncMutex.tryLock()) {
-            Timber.i("Sync already in progress, skipping this request")
+            hasPendingSyncRequest = true
+            Timber.i("Sync already in progress, queued pending sync request")
             return
         }
         try {
-            _status.value = SyncStatus.PENDING
-            try {
-                pushLocalChanges()
-                pullServerChanges()
-                _status.value = SyncStatus.SYNCED
-            } catch (e: Exception) {
-                val offline = e is java.io.IOException
-                Timber.e(e, "Sync failed")
-                _status.value = if (offline) SyncStatus.OFFLINE else SyncStatus.ERROR
+            while (true) {
+                hasPendingSyncRequest = false
+                _status.value = SyncStatus.PENDING
+                try {
+                    pushLocalChanges()
+                    pullServerChanges()
+                    _status.value = SyncStatus.SYNCED
+                } catch (e: Exception) {
+                    val offline = e is java.io.IOException
+                    Timber.e(e, "Sync failed")
+                    _status.value = if (offline) SyncStatus.OFFLINE else SyncStatus.ERROR
+                    break
+                }
+                if (!hasPendingSyncRequest) {
+                    break
+                }
             }
         } finally {
             syncMutex.unlock()
@@ -197,12 +213,25 @@ class SyncEngine @Inject constructor(
             }
         }
         // The tombstoned entities no longer exist locally; drop their
-        // mappings so a future local id is never reused for them.
+        // mappings and remove them from the mirror.
         delta.tombstones.forEach {
             syncIdMapDao.removeBySyncId(it.entityType, it.entityId)
+            syncStateDao.remove(it.entityType, it.entityId)
         }
-        val accepted = candidates.filterNot { deltaCalculator.key(it.entityType, it.entityId) in retryKeys }
-        replaceMirror(accepted)
+        val now = System.currentTimeMillis()
+        val acceptedUpserts = delta.upserts
+            .filterNot { deltaCalculator.key(it.entityType, it.entityId) in retryKeys }
+            .map {
+                SyncStateDBO(
+                    entityType = it.entityType,
+                    entityId = it.entityId,
+                    contentHash = deltaCalculator.contentHash(it.payload),
+                    syncedAt = now,
+                )
+            }
+        if (acceptedUpserts.isNotEmpty()) {
+            syncStateDao.insertAll(acceptedUpserts)
+        }
     }
 
     private fun buildPushItems(delta: SyncDeltaCalculator.Delta): List<SyncPushItem> {
@@ -230,21 +259,6 @@ class SyncEngine @Inject constructor(
             )
         }
         return upserts + tombstones
-    }
-
-    private suspend fun replaceMirror(candidates: List<SyncDeltaCalculator.Candidate>) {
-        val now = System.currentTimeMillis()
-        syncStateDao.clear()
-        syncStateDao.insertAll(
-            candidates.map {
-                SyncStateDBO(
-                    entityType = it.entityType,
-                    entityId = it.entityId,
-                    contentHash = deltaCalculator.contentHash(it.payload),
-                    syncedAt = now,
-                )
-            },
-        )
     }
 
     private suspend fun buildCandidates(mappings: IdMappings): List<SyncDeltaCalculator.Candidate> {
@@ -405,23 +419,29 @@ class SyncEngine @Inject constructor(
         val mirror = syncStateDao.getAll().associateBy {
             deltaCalculator.key(it.entityType, it.entityId)
         }
-        // Categories and tags first: activities and entries reference them.
-        pulled.categories.forEach { data -> applyServerCategory(data, mappings) }
-        pulled.tags.forEach { data -> applyServerTag(data, mappings) }
-        pulled.activities.forEach { activity -> applyServerActivity(activity, mirror, mappings) }
-        pulled.time_entries.forEach { entry -> applyServerEntry(entry, mirror, mappings) }
-        // Timetable entities after their referenced activities and in
-        // dependency order: events before their overrides and todos.
-        pulled.timetable_events.forEach { data -> applyServerTimetableEvent(data, mappings) }
-        pulled.timetable_days.forEach { data -> applyServerTimetableDay(data, mappings) }
-        pulled.timetable_overrides.forEach { data -> applyServerTimetableOverride(data, mappings) }
-        pulled.timetable_todos.forEach { data -> applyServerTimetableTodo(data, mappings) }
-        pulled.subject_goals.forEach { data -> applyServerSubjectGoal(data, mappings) }
+        isPulling = true
+        try {
+            // Categories and tags first: activities and entries reference them.
+            pulled.categories.forEach { data -> applyServerCategory(data, mirror, mappings) }
+            pulled.tags.forEach { data -> applyServerTag(data, mirror, mappings) }
+            pulled.activities.forEach { activity -> applyServerActivity(activity, mirror, mappings) }
+            pulled.time_entries.forEach { entry -> applyServerEntry(entry, mirror, mappings) }
+            // Timetable entities after their referenced activities and in
+            // dependency order: events before their overrides and todos.
+            pulled.timetable_events.forEach { data -> applyServerTimetableEvent(data, mirror, mappings) }
+            pulled.timetable_days.forEach { data -> applyServerTimetableDay(data, mirror, mappings) }
+            pulled.timetable_overrides.forEach { data -> applyServerTimetableOverride(data, mirror, mappings) }
+            pulled.timetable_todos.forEach { data -> applyServerTimetableTodo(data, mirror, mappings) }
+            pulled.subject_goals.forEach { data -> applyServerSubjectGoal(data, mirror, mappings) }
+        } finally {
+            isPulling = false
+        }
         credentialStore.lastSyncMarker = pulled.server_time ?: nowIso()
     }
 
     private suspend fun applyServerCategory(
         data: Map<String, Any?>,
+        mirror: Map<String, SyncStateDBO>,
         mappings: IdMappings,
     ) {
         val syncId = data["id"] as? String ?: return
@@ -438,8 +458,32 @@ class SyncEngine @Inject constructor(
         }
 
         if (localId != null) {
-            // Known category: the repository has no update, so the local
-            // version wins and is re-pushed on the next sync.
+            val local = categoryRepo.get(localId) ?: return
+            val localHash = deltaCalculator.contentHash(
+                categoryPayloadContent(
+                    syncId = syncId,
+                    name = local.name,
+                    color = local.color.colorInt,
+                    colorId = local.color.colorId,
+                    note = local.note,
+                ),
+            )
+            val mirrorHash = mirror[deltaCalculator.key(ENTITY_CATEGORY, syncId)]?.contentHash
+            if (mirrorHash != null && mirrorHash == localHash) {
+                val name = data["name"] as? String ?: local.name
+                val color = data["color"] as? String ?: local.color.colorInt
+                val colorId = (data["color_id"] as? Double)?.toInt() ?: local.color.colorId
+                val note = data["note"] as? String ?: local.note
+                val updated = local.copy(
+                    name = name,
+                    color = AppColor(colorId = colorId, colorInt = color),
+                    note = note,
+                )
+                if (updated != local) {
+                    categoryRepo.add(updated)
+                }
+                insertMirror(ENTITY_CATEGORY, syncId, categoryPayloadContent(syncId, name, color, colorId, note))
+            }
             return
         }
 
@@ -461,6 +505,7 @@ class SyncEngine @Inject constructor(
 
     private suspend fun applyServerTimetableEvent(
         data: Map<String, Any?>,
+        mirror: Map<String, SyncStateDBO>,
         mappings: IdMappings,
     ) {
         val syncId = data["id"] as? String ?: return
@@ -475,12 +520,46 @@ class SyncEngine @Inject constructor(
             return
         }
 
-        // Known event: the repository has no update, so the local
-        // version wins and is re-pushed on the next sync.
-        if (localId != null) return
+        val activitySyncId = data["activity_sync_id"] as? String
+        val activityLocalId = activitySyncId?.let { mappings.localIdOf(ENTITY_ACTIVITY, it) }
+
+        if (localId != null) {
+            val existing = timetableRepo.getAllEvents().firstOrNull { it.id == localId }
+            if (existing != null) {
+                val existingActivitySyncId = existing.activityTypeId?.let { mappings.existingSyncId(ENTITY_ACTIVITY, it) }
+                val localHash = deltaCalculator.contentHash(
+                    timetableEventPayloadContent(syncId, existing, existingActivitySyncId),
+                )
+                val mirrorHash = mirror[deltaCalculator.key(ENTITY_TIMETABLE_EVENT, syncId)]?.contentHash
+                if (mirrorHash != null && mirrorHash == localHash) {
+                    val name = data["name"] as? String ?: existing.name
+                    val dayOfWeek = (data["day_of_week"] as? Double)?.toInt() ?: existing.dayOfWeek
+                    val startTime = (data["start_time"] as? Double)?.toInt() ?: existing.startTime
+                    val endTime = (data["end_time"] as? Double)?.toInt() ?: existing.endTime
+                    val room = data["room"] as? String ?: existing.room
+                    val typeOrdinal = (data["type"] as? Double)?.toInt() ?: existing.type.ordinal
+                    val type = TimetableEvent.Type.entries.getOrNull(typeOrdinal) ?: existing.type
+                    val comment = data["comment"] as? String ?: existing.comment
+                    val updated = existing.copy(
+                        name = name,
+                        dayOfWeek = dayOfWeek,
+                        startTime = startTime,
+                        endTime = endTime,
+                        room = room,
+                        type = type,
+                        comment = comment,
+                        activityTypeId = activityLocalId,
+                    )
+                    if (updated != existing) {
+                        timetableRepo.addEvent(updated)
+                    }
+                    insertMirror(ENTITY_TIMETABLE_EVENT, syncId, syncPayloadOf(data))
+                }
+            }
+            return
+        }
 
         val name = data["name"] as? String ?: return
-        val activitySyncId = data["activity_sync_id"] as? String
         val typeOrdinal = (data["type"] as? Double)?.toInt() ?: 0
         val type = TimetableEvent.Type.entries.getOrNull(typeOrdinal) ?: TimetableEvent.Type.LECTURE
         Timber.i("Importing timetable event %s from sync", syncId)
@@ -493,7 +572,7 @@ class SyncEngine @Inject constructor(
                 room = data["room"] as? String ?: "",
                 type = type,
                 comment = data["comment"] as? String ?: "",
-                activityTypeId = activitySyncId?.let { mappings.localIdOf(ENTITY_ACTIVITY, it) },
+                activityTypeId = activityLocalId,
             ),
         )
         mappings.remember(ENTITY_TIMETABLE_EVENT, newLocalId, syncId)
@@ -502,6 +581,7 @@ class SyncEngine @Inject constructor(
 
     private suspend fun applyServerTimetableDay(
         data: Map<String, Any?>,
+        mirror: Map<String, SyncStateDBO>,
         mappings: IdMappings,
     ) {
         val syncId = data["id"] as? String ?: return
@@ -516,7 +596,25 @@ class SyncEngine @Inject constructor(
             return
         }
 
-        if (localId != null) return
+        if (localId != null) {
+            val existing = timetableRepo.getDays().firstOrNull { it.id == localId }
+            if (existing != null) {
+                val localHash = deltaCalculator.contentHash(
+                    timetableDayPayloadContent(syncId, existing),
+                )
+                val mirrorHash = mirror[deltaCalculator.key(ENTITY_TIMETABLE_DAY, syncId)]?.contentHash
+                if (mirrorHash != null && mirrorHash == localHash) {
+                    val freeDay = data["free_day"] as? Boolean ?: existing.freeDay
+                    val note = data["note"] as? String ?: existing.note
+                    val updated = existing.copy(freeDay = freeDay, note = note)
+                    if (updated != existing) {
+                        timetableRepo.addDay(updated)
+                    }
+                    insertMirror(ENTITY_TIMETABLE_DAY, syncId, syncPayloadOf(data))
+                }
+            }
+            return
+        }
 
         val date = data["date"] as? String ?: return
         Timber.i("Importing timetable day %s from sync", syncId)
@@ -533,6 +631,7 @@ class SyncEngine @Inject constructor(
 
     private suspend fun applyServerTimetableOverride(
         data: Map<String, Any?>,
+        mirror: Map<String, SyncStateDBO>,
         mappings: IdMappings,
     ) {
         val syncId = data["id"] as? String ?: return
@@ -547,10 +646,34 @@ class SyncEngine @Inject constructor(
             return
         }
 
-        if (localId != null) return
-
         val eventSyncId = data["event_sync_id"] as? String ?: return
         val eventLocalId = mappings.localIdOf(ENTITY_TIMETABLE_EVENT, eventSyncId) ?: return
+
+        if (localId != null) {
+            val existing = timetableRepo.getAllOverrides().firstOrNull { it.id == localId }
+            if (existing != null) {
+                val localHash = deltaCalculator.contentHash(
+                    timetableOverridePayloadContent(syncId, existing, eventSyncId),
+                )
+                val mirrorHash = mirror[deltaCalculator.key(ENTITY_TIMETABLE_OVERRIDE, syncId)]?.contentHash
+                if (mirrorHash != null && mirrorHash == localHash) {
+                    val updated = existing.copy(
+                        eventId = eventLocalId,
+                        room = data["room"] as? String ?: existing.room,
+                        startTime = (data["start_time"] as? Double)?.toInt() ?: existing.startTime,
+                        endTime = (data["end_time"] as? Double)?.toInt() ?: existing.endTime,
+                        cancelled = data["cancelled"] as? Boolean ?: existing.cancelled,
+                        note = data["note"] as? String ?: existing.note,
+                    )
+                    if (updated != existing) {
+                        timetableRepo.addOverride(updated)
+                    }
+                    insertMirror(ENTITY_TIMETABLE_OVERRIDE, syncId, syncPayloadOf(data))
+                }
+            }
+            return
+        }
+
         val date = data["date"] as? String ?: return
         Timber.i("Importing timetable override %s from sync", syncId)
         val newLocalId = timetableRepo.addOverride(
@@ -570,6 +693,7 @@ class SyncEngine @Inject constructor(
 
     private suspend fun applyServerTimetableTodo(
         data: Map<String, Any?>,
+        mirror: Map<String, SyncStateDBO>,
         mappings: IdMappings,
     ) {
         val syncId = data["id"] as? String ?: return
@@ -587,17 +711,34 @@ class SyncEngine @Inject constructor(
         val done = data["done"] as? Boolean ?: false
 
         if (localId != null) {
-            // Only the done flag changes after creation; apply it when
-            // the local todo did not change since the last push.
             val existing = timetableRepo.getAllTodos().firstOrNull { it.id == localId }
-            if (existing != null && existing.done != done) {
-                // Apply the server state when the local todo did not
-                // change since the last push.
-                val localMirrorHash = syncStateDao.getAll()
-                    .firstOrNull { it.entityType == ENTITY_TIMETABLE_TODO && it.entityId == syncId }
-                    ?.contentHash
-                if (localMirrorHash == deltaCalculator.contentHash(syncPayloadOf(data))) {
-                    timetableRepo.setTodoDone(localId, done)
+            if (existing != null) {
+                val eventSyncId = mappings.existingSyncId(ENTITY_TIMETABLE_EVENT, existing.eventId)
+                if (eventSyncId != null) {
+                    val localHash = deltaCalculator.contentHash(
+                        timetableTodoPayloadContent(
+                            syncId = syncId,
+                            todo = existing,
+                            eventSyncId = eventSyncId,
+                        ),
+                    )
+                    val mirrorHash = mirror[deltaCalculator.key(ENTITY_TIMETABLE_TODO, syncId)]?.contentHash
+                    if (mirrorHash != null && mirrorHash == localHash) {
+                        if (existing.done != done) {
+                            timetableRepo.setTodoDone(localId, done)
+                        }
+                        insertMirror(ENTITY_TIMETABLE_TODO, syncId, syncPayloadOf(data))
+                    } else if (mirrorHash != null && mirrorHash != localHash && existing.done != done) {
+                        syncConflictDao.insert(
+                            SyncConflictDBO(
+                                entityType = ENTITY_TIMETABLE_TODO,
+                                entityId = syncId,
+                                resolution = RESOLUTION_LOCAL_KEPT_NAME,
+                                detail = "concurrent edit on todo done: local '${existing.done}' vs server '$done'",
+                                createdAt = System.currentTimeMillis(),
+                            ),
+                        )
+                    }
                 }
             }
             return
@@ -623,6 +764,7 @@ class SyncEngine @Inject constructor(
 
     private suspend fun applyServerSubjectGoal(
         data: Map<String, Any?>,
+        mirror: Map<String, SyncStateDBO>,
         mappings: IdMappings,
     ) {
         val syncId = data["id"] as? String ?: return
@@ -642,18 +784,32 @@ class SyncEngine @Inject constructor(
         val targetSeconds = (data["target_seconds"] as? Double)?.toLong() ?: 0L
         val ects = (data["ects"] as? Double)
 
-        // The local target wins when it changed since the last push;
-        // otherwise the server state is applied.
         if (localGoal != null) {
-            val localMirrorHash = syncStateDao.getAll()
-                .firstOrNull { it.entityType == ENTITY_SUBJECT_GOAL && it.entityId == syncId }
-                ?.contentHash
-            if (localMirrorHash == deltaCalculator.contentHash(syncPayloadOf(data))) {
+            val localHash = deltaCalculator.contentHash(
+                subjectGoalPayloadContent(
+                    syncId = syncId,
+                    goal = localGoal,
+                    activitySyncId = activitySyncId,
+                ),
+            )
+            val mirrorHash = mirror[deltaCalculator.key(ENTITY_SUBJECT_GOAL, syncId)]?.contentHash
+            if (mirrorHash != null && mirrorHash == localHash) {
                 subjectGoalRepo.set(
                     SubjectGoal(
                         activityTypeId = activityLocalId,
                         targetSeconds = targetSeconds,
                         ects = ects,
+                    ),
+                )
+                insertMirror(ENTITY_SUBJECT_GOAL, syncId, syncPayloadOf(data))
+            } else if (mirrorHash != null && mirrorHash != localHash && (localGoal.targetSeconds != targetSeconds || localGoal.ects != ects)) {
+                syncConflictDao.insert(
+                    SyncConflictDBO(
+                        entityType = ENTITY_SUBJECT_GOAL,
+                        entityId = syncId,
+                        resolution = RESOLUTION_LOCAL_KEPT_NAME,
+                        detail = "concurrent edit on subject goal: local ${localGoal.targetSeconds}s vs server ${targetSeconds}s",
+                        createdAt = System.currentTimeMillis(),
                     ),
                 )
             }
@@ -674,6 +830,7 @@ class SyncEngine @Inject constructor(
 
     private suspend fun applyServerTag(
         data: Map<String, Any?>,
+        mirror: Map<String, SyncStateDBO>,
         mappings: IdMappings,
     ) {
         val syncId = data["id"] as? String ?: return
@@ -689,8 +846,62 @@ class SyncEngine @Inject constructor(
         }
 
         if (localId != null) {
-            // Known tag: the repository has no update, so the local
-            // version wins and is re-pushed on the next sync.
+            val local = recordTagRepo.get(localId) ?: return
+            val localHash = deltaCalculator.contentHash(
+                tagPayloadContent(
+                    syncId = syncId,
+                    name = local.name,
+                    icon = local.icon,
+                    color = local.color.colorInt,
+                    colorId = local.color.colorId,
+                    iconColorSource = local.iconColorSource,
+                    note = local.note,
+                    archived = local.archived,
+                    valueType = local.valueType.name,
+                    valueSuffix = local.valueSuffix,
+                ),
+            )
+            val mirrorHash = mirror[deltaCalculator.key(ENTITY_RECORD_TAG, syncId)]?.contentHash
+            if (mirrorHash != null && mirrorHash == localHash) {
+                val name = data["name"] as? String ?: local.name
+                val icon = data["icon"] as? String ?: local.icon
+                val color = data["color"] as? String ?: local.color.colorInt
+                val colorId = (data["color_id"] as? Double)?.toInt() ?: local.color.colorId
+                val note = data["note"] as? String ?: local.note
+                val archived = data["archived"] as? Boolean ?: local.archived
+                val valueType = (data["value_type"] as? String)
+                    ?.let { type -> RecordTagValueType.entries.firstOrNull { it.name == type } }
+                    ?: local.valueType
+                val valueSuffix = data["value_suffix"] as? String ?: local.valueSuffix
+                val updated = local.copy(
+                    name = name,
+                    icon = icon,
+                    color = AppColor(colorId = colorId, colorInt = color),
+                    note = note,
+                    archived = archived,
+                    valueType = valueType,
+                    valueSuffix = valueSuffix,
+                )
+                if (updated != local) {
+                    recordTagRepo.add(updated)
+                }
+                insertMirror(
+                    ENTITY_RECORD_TAG,
+                    syncId,
+                    tagPayloadContent(
+                        syncId = syncId,
+                        name = name,
+                        icon = icon,
+                        color = color,
+                        colorId = colorId,
+                        iconColorSource = local.iconColorSource,
+                        note = note,
+                        archived = archived,
+                        valueType = valueType.name,
+                        valueSuffix = valueSuffix,
+                    ),
+                )
+            }
             return
         }
 
@@ -795,18 +1006,13 @@ class SyncEngine @Inject constructor(
         val localHash = deltaCalculator.contentHash(local.toPayloadContent(syncId, localCategorySyncIds))
         val mirrorHash = mirror[deltaCalculator.key(ENTITY_ACTIVITY, syncId)]?.contentHash
         if (mirrorHash != null && mirrorHash == localHash) {
-            if (activity.name != local.name) {
-                // Activity renames from the server cannot be applied because the
-                // repository has no update; the local name wins on the next push.
-                syncConflictDao.insert(
-                    SyncConflictDBO(
-                        entityType = ENTITY_ACTIVITY,
-                        entityId = activity.id,
-                        resolution = RESOLUTION_LOCAL_KEPT_NAME,
-                        detail = "server name '${activity.name}' was not applied",
-                        createdAt = System.currentTimeMillis(),
-                    ),
-                )
+            val updatedLocal = local.copy(
+                name = activity.name,
+                icon = activity.icon,
+                color = AppColor(colorId = activity.color_id, colorInt = activity.color),
+            )
+            if (updatedLocal != local) {
+                recordTypeRepo.add(updatedLocal)
             }
             // Apply server side category assignment changes.
             val serverCategoryIds = decodeStringList(activity.category)
@@ -816,6 +1022,30 @@ class SyncEngine @Inject constructor(
             val toRemove = (localCategoryIds - serverCategoryIds.toSet()).toList()
             if (toAdd.isNotEmpty()) recordTypeCategoryRepo.addCategories(localId, toAdd)
             if (toRemove.isNotEmpty()) recordTypeCategoryRepo.removeCategories(localId, toRemove)
+
+            insertMirror(
+                ENTITY_ACTIVITY,
+                activity.id,
+                mapOf(
+                    "id" to activity.id,
+                    "name" to activity.name,
+                    "icon" to activity.icon,
+                    "color" to activity.color,
+                    "color_id" to activity.color_id,
+                    "archived" to activity.archived,
+                    "category" to encodeStringList(decodeStringList(activity.category).sorted()),
+                ),
+            )
+        } else if (mirrorHash != null && mirrorHash != localHash && activity.name != local.name) {
+            syncConflictDao.insert(
+                SyncConflictDBO(
+                    entityType = ENTITY_ACTIVITY,
+                    entityId = activity.id,
+                    resolution = RESOLUTION_LOCAL_KEPT_NAME,
+                    detail = "concurrent edit on activity name: local '${local.name}' vs server '${activity.name}'",
+                    createdAt = System.currentTimeMillis(),
+                ),
+            )
         }
         if (activity.archived && !local.hidden) {
             recordTypeRepo.archive(localId)
@@ -943,6 +1173,18 @@ class SyncEngine @Inject constructor(
                 tags = localizeTags(parsed.tags, mappings),
             ),
         )
+        if (runningRecordRepo.has(typeLocalId)) {
+            val localRunning = runningRecordRepo.get(typeLocalId)
+            if (localRunning != null && localRunning.timeStarted <= parsed.timeEnded) {
+                Timber.i("Stopping local running timer %d because finished entry was imported from sync", typeLocalId)
+                removeRunningRecordMediator.remove(typeId = typeLocalId)
+                val runningSyncId = mappings.existingSyncId(ENTITY_RUNNING_RECORD, typeLocalId)
+                if (runningSyncId != null) {
+                    mappings.forget(ENTITY_RUNNING_RECORD, runningSyncId)
+                    syncStateDao.remove(ENTITY_RUNNING_RECORD, runningSyncId)
+                }
+            }
+        }
         mappings.remember(ENTITY_TIME_ENTRY, localId, entry.id)
         syncStateDao.insertAll(
             listOf(
@@ -1043,11 +1285,26 @@ class SyncEngine @Inject constructor(
         val localTypeId = mappings.localIdOf(ENTITY_RUNNING_RECORD, entry.id)
 
         if (entry.deleted_at != null) {
-            if (localTypeId != null) {
-                if (runningRecordRepo.has(localTypeId)) {
-                    removeRunningRecordMediator.remove(typeId = localTypeId)
+            val targetTypeId = localTypeId ?: run {
+                val actId = entry.activity_id.takeIf { it.isNotEmpty() }?.let { mappings.localIdOf(ENTITY_ACTIVITY, it) }
+                if (actId != null && runningRecordRepo.has(actId)) {
+                    val localRunning = runningRecordRepo.get(actId)
+                    val serverStart = parseEpochMilli(entry.started_at)
+                    if (serverStart == null || (localRunning != null && Math.abs(serverStart - localRunning.timeStarted) < 5000L)) {
+                        actId
+                    } else null
+                } else null
+            }
+            if (targetTypeId != null) {
+                if (runningRecordRepo.has(targetTypeId)) {
+                    removeRunningRecordMediator.remove(typeId = targetTypeId)
                 }
                 mappings.forget(ENTITY_RUNNING_RECORD, entry.id)
+                val existingSyncId = mappings.existingSyncId(ENTITY_RUNNING_RECORD, targetTypeId)
+                if (existingSyncId != null) {
+                    mappings.forget(ENTITY_RUNNING_RECORD, existingSyncId)
+                    syncStateDao.remove(ENTITY_RUNNING_RECORD, existingSyncId)
+                }
                 syncStateDao.remove(ENTITY_RUNNING_RECORD, entry.id)
             }
             return

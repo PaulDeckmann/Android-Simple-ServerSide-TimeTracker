@@ -6,15 +6,23 @@ import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import com.example.util.simpletimetracker.data_sync.engine.SyncEngine
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 @Singleton
 class SyncScheduler @Inject constructor(
     @ApplicationContext private val context: Context,
+    private val syncEngine: SyncEngine,
 ) {
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     fun schedulePeriodicSync() {
         val request = PeriodicWorkRequestBuilder<SyncWorker>(
@@ -35,14 +43,9 @@ class SyncScheduler @Inject constructor(
     }
 
     fun syncNow() {
-        val request = androidx.work.OneTimeWorkRequestBuilder<SyncWorker>()
-            .setConstraints(
-                Constraints.Builder()
-                    .setRequiredNetworkType(NetworkType.CONNECTED)
-                    .build(),
-            )
-            .build()
-        WorkManager.getInstance(context).enqueue(request)
+        scope.launch {
+            runCatching { syncEngine.syncNow() }
+        }
     }
 
     companion object {

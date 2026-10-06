@@ -82,6 +82,7 @@ class Activity(Base):
     __tablename__ = "activities"
     __table_args__ = (
         Index("ix_activities_updated_at", "updated_at"),
+        Index("ix_activities_user_updated", "user_id", "updated_at"),
     )
 
     id = Column(String, primary_key=True, default=new_id)
@@ -107,6 +108,8 @@ class TimeEntry(Base):
     __table_args__ = (
         Index("ix_time_entries_updated_at", "updated_at"),
         Index("ix_time_entries_user_started", "user_id", "started_at"),
+        Index("ix_time_entries_user_updated", "user_id", "updated_at"),
+        Index("ix_time_entries_user_running", "user_id", "ended_at", "deleted_at"),
     )
 
     id = Column(String, primary_key=True, default=new_id)
@@ -128,6 +131,7 @@ class Goal(Base):
     __tablename__ = "goals"
     __table_args__ = (
         Index("ix_goals_updated_at", "updated_at"),
+        Index("ix_goals_user_updated", "user_id", "updated_at"),
     )
 
     id = Column(String, primary_key=True, default=new_id)
@@ -144,6 +148,9 @@ class SyncCategory(Base):
     """Generic sync storage for categories; data holds the app owned json payload."""
 
     __tablename__ = "sync_categories"
+    __table_args__ = (
+        Index("ix_sync_categories_user_updated", "user_id", "updated_at"),
+    )
 
     id = Column(String, primary_key=True)
     user_id = Column(String, nullable=False, index=True)
@@ -157,6 +164,9 @@ class SyncTag(Base):
     """Generic sync storage for record tags; data holds the app owned json payload."""
 
     __tablename__ = "sync_tags"
+    __table_args__ = (
+        Index("ix_sync_tags_user_updated", "user_id", "updated_at"),
+    )
 
     id = Column(String, primary_key=True)
     user_id = Column(String, nullable=False, index=True)
@@ -182,6 +192,8 @@ class SyncTimetable(Base):
     __table_args__ = (
         Index("ix_sync_timetable_updated_at", "updated_at"),
         Index("ix_sync_timetable_type_id", "entity_type", "id"),
+        Index("ix_sync_timetable_user_updated", "user_id", "updated_at"),
+        Index("ix_sync_timetable_user_type", "user_id", "entity_type"),
     )
 
 

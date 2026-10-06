@@ -6,8 +6,10 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 
 /**
@@ -16,10 +18,8 @@ import kotlinx.coroutines.launch
  * seconds. The periodic WorkManager sync remains as a background fallback;
  * this subscriber only runs while the app process is alive.
  *
- * The debounced collector never cancels a running sync: cancelling a sync
- * mid apply left partially imported data behind (duplicated timers, missing
- * id mappings). Events arriving while a sync runs trigger one more sync
- * afterwards, so the last change always converges.
+ * Events generated as side effects while the engine is pulling server changes
+ * are ignored to prevent ping-pong re-sync loops.
  */
 @Singleton
 class SyncOnDataChangeInteractor @Inject constructor(
@@ -28,9 +28,11 @@ class SyncOnDataChangeInteractor @Inject constructor(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    @OptIn(FlowPreview::class)
     fun subscribe() {
         scope.launch {
             LocalDataChangedBus.events
+                .filter { !syncEngine.isPulling }
                 .debounce(SYNC_DEBOUNCE_MS)
                 .collect {
                     runCatching { syncEngine.syncNow() }

@@ -1022,13 +1022,27 @@ def is_resurrection(existing, incoming_deleted) -> bool:
 def sync_push(body: SyncPushRequest, db: Session = Depends(get_db), user_id: str = Depends(require_user)):
     applied = 0
     conflicts = []
+
+    # Batch prefetch existing entities to eliminate N+1 queries
+    activity_ids = [item.data["id"] for item in body.items if item.entity_type == "activity" and "id" in item.data]
+    entry_ids = [item.data["id"] for item in body.items if item.entity_type == "time_entry" and "id" in item.data]
+    category_ids = [item.data["id"] for item in body.items if item.entity_type == "category" and "id" in item.data]
+    tag_ids = [item.data["id"] for item in body.items if item.entity_type == "record_tag" and "id" in item.data]
+    timetable_ids = [item.data["id"] for item in body.items if item.entity_type in TIMETABLE_TYPES and "id" in item.data]
+
+    activities_map = {a.id: a for a in db.query(Activity).filter(Activity.id.in_(activity_ids)).all()} if activity_ids else {}
+    entries_map = {e.id: e for e in db.query(TimeEntry).filter(TimeEntry.id.in_(entry_ids)).all()} if entry_ids else {}
+    categories_map = {c.id: c for c in db.query(SyncCategory).filter(SyncCategory.id.in_(category_ids)).all()} if category_ids else {}
+    tags_map = {t.id: t for t in db.query(SyncTag).filter(SyncTag.id.in_(tag_ids)).all()} if tag_ids else {}
+    timetable_map = {(t.id, t.entity_type): t for t in db.query(SyncTimetable).filter(SyncTimetable.id.in_(timetable_ids)).all()} if timetable_ids else {}
+
     for item in body.items:
         data = item.data
         entity_type = item.entity_type
         incoming_updated = parse_dt(data.get("updated_at")) if data.get("updated_at") else utcnow()
         incoming_deleted = parse_dt(data["deleted_at"]) if data.get("deleted_at") else None
         if entity_type == "activity":
-            existing = db.query(Activity).filter(Activity.id == data["id"]).first()
+            existing = activities_map.get(data["id"])
             if existing is not None and existing.user_id != user_id:
                 conflicts.append({"entity_type": entity_type, "id": data["id"], "resolution": "rejected"})
                 continue
@@ -1037,25 +1051,25 @@ def sync_push(body: SyncPushRequest, db: Session = Depends(get_db), user_id: str
                     # Tombstone for an unknown activity: nothing to delete.
                     applied += 1
                     continue
-                db.add(
-                    Activity(
-                        id=data["id"],
-                        user_id=user_id,
-                        name=data.get("name", ""),
-                        color=data.get("color", ""),
-                        color_id=data.get("color_id", 0),
-                        icon=data.get("icon", ""),
-                        sort_order=data.get("sort_order", 0),
-                        archived=data.get("archived", False),
-                        parent_activity_id=data.get("parent_activity_id"),
-                        category=data.get("category", ""),
-                        goal_seconds_per_week=data.get("goal_seconds_per_week"),
-                        goal_seconds_total=data.get("goal_seconds_total"),
-                        goal_days_per_month=data.get("goal_days_per_month"),
-                        created_at=parse_dt(data["created_at"]) if data.get("created_at") else utcnow(),
-                        updated_at=incoming_updated,
-                    ),
+                new_act = Activity(
+                    id=data["id"],
+                    user_id=user_id,
+                    name=data.get("name", ""),
+                    color=data.get("color", ""),
+                    color_id=data.get("color_id", 0),
+                    icon=data.get("icon", ""),
+                    sort_order=data.get("sort_order", 0),
+                    archived=data.get("archived", False),
+                    parent_activity_id=data.get("parent_activity_id"),
+                    category=data.get("category", ""),
+                    goal_seconds_per_week=data.get("goal_seconds_per_week"),
+                    goal_seconds_total=data.get("goal_seconds_total"),
+                    goal_days_per_month=data.get("goal_days_per_month"),
+                    created_at=parse_dt(data["created_at"]) if data.get("created_at") else utcnow(),
+                    updated_at=incoming_updated,
                 )
+                db.add(new_act)
+                activities_map[data["id"]] = new_act
                 applied += 1
             elif is_resurrection(existing, incoming_deleted):
                 conflicts.append({"entity_type": entity_type, "id": data["id"], "resolution": "tombstone_kept"})
@@ -1077,7 +1091,7 @@ def sync_push(body: SyncPushRequest, db: Session = Depends(get_db), user_id: str
             else:
                 conflicts.append({"entity_type": entity_type, "id": data["id"], "resolution": "server_kept_newer"})
         elif entity_type == "time_entry":
-            existing = db.query(TimeEntry).filter(TimeEntry.id == data["id"]).first()
+            existing = entries_map.get(data["id"])
             if existing is not None and existing.user_id != user_id:
                 conflicts.append({"entity_type": entity_type, "id": data["id"], "resolution": "rejected"})
                 continue
@@ -1089,22 +1103,22 @@ def sync_push(body: SyncPushRequest, db: Session = Depends(get_db), user_id: str
                 if not data.get("activity_id") or not data.get("started_at"):
                     conflicts.append({"entity_type": entity_type, "id": data["id"], "resolution": "invalid"})
                     continue
-                db.add(
-                    TimeEntry(
-                        id=data["id"],
-                        user_id=user_id,
-                        activity_id=data["activity_id"],
-                        parent_activity_ids=data.get("parent_activity_ids", ""),
-                        started_at=parse_dt(data["started_at"]),
-                        ended_at=parse_dt(data["ended_at"]) if data.get("ended_at") else None,
-                        duration_seconds=data.get("duration_seconds", 0),
-                        comment=data.get("comment", ""),
-                        tags=data.get("tags", ""),
-                        created_at=parse_dt(data["created_at"]) if data.get("created_at") else utcnow(),
-                        updated_at=incoming_updated,
-                        sync_status="synced",
-                    ),
+                new_entry = TimeEntry(
+                    id=data["id"],
+                    user_id=user_id,
+                    activity_id=data["activity_id"],
+                    parent_activity_ids=data.get("parent_activity_ids", ""),
+                    started_at=parse_dt(data["started_at"]),
+                    ended_at=parse_dt(data["ended_at"]) if data.get("ended_at") else None,
+                    duration_seconds=data.get("duration_seconds", 0),
+                    comment=data.get("comment", ""),
+                    tags=data.get("tags", ""),
+                    created_at=parse_dt(data["created_at"]) if data.get("created_at") else utcnow(),
+                    updated_at=incoming_updated,
+                    sync_status="synced",
                 )
+                db.add(new_entry)
+                entries_map[data["id"]] = new_entry
                 applied += 1
             elif incoming_deleted is not None:
                 # Tombstone for a known entry: mark deleted, keep content.
@@ -1134,7 +1148,8 @@ def sync_push(body: SyncPushRequest, db: Session = Depends(get_db), user_id: str
         elif entity_type in ("category", "record_tag"):
             # Generic opaque payload storage: the app owns the data layout.
             table = SyncCategory if entity_type == "category" else SyncTag
-            existing = db.query(table).filter(table.id == data["id"]).first()
+            current_map = categories_map if entity_type == "category" else tags_map
+            existing = current_map.get(data["id"])
             if existing is not None and existing.user_id != user_id:
                 conflicts.append({"entity_type": entity_type, "id": data["id"], "resolution": "rejected"})
                 continue
@@ -1144,14 +1159,14 @@ def sync_push(body: SyncPushRequest, db: Session = Depends(get_db), user_id: str
                     # Tombstone for an unknown entity: nothing to delete.
                     applied += 1
                     continue
-                db.add(
-                    table(
-                        id=data["id"],
-                        user_id=user_id,
-                        data=json.dumps(data),
-                        updated_at=incoming_updated,
-                    ),
+                new_cat_or_tag = table(
+                    id=data["id"],
+                    user_id=user_id,
+                    data=json.dumps(data),
+                    updated_at=incoming_updated,
                 )
+                db.add(new_cat_or_tag)
+                current_map[data["id"]] = new_cat_or_tag
                 applied += 1
             elif incoming_deleted is not None:
                 if incoming_updated >= _aware(existing.updated_at):
@@ -1171,11 +1186,7 @@ def sync_push(body: SyncPushRequest, db: Session = Depends(get_db), user_id: str
                 conflicts.append({"entity_type": entity_type, "id": data["id"], "resolution": "server_kept_newer"})
         elif entity_type in TIMETABLE_TYPES:
             # Generic opaque payload storage: the app owns the data layout.
-            existing = (
-                db.query(SyncTimetable)
-                .filter(SyncTimetable.id == data["id"], SyncTimetable.entity_type == entity_type)
-                .first()
-            )
+            existing = timetable_map.get((data["id"], entity_type))
             if existing is not None and existing.user_id != user_id:
                 conflicts.append({"entity_type": entity_type, "id": data["id"], "resolution": "rejected"})
                 continue
@@ -1184,15 +1195,15 @@ def sync_push(body: SyncPushRequest, db: Session = Depends(get_db), user_id: str
                     # Tombstone for an unknown entity: nothing to delete.
                     applied += 1
                     continue
-                db.add(
-                    SyncTimetable(
-                        id=data["id"],
-                        user_id=user_id,
-                        entity_type=entity_type,
-                        data=json.dumps(data),
-                        updated_at=incoming_updated,
-                    ),
+                new_tt = SyncTimetable(
+                    id=data["id"],
+                    user_id=user_id,
+                    entity_type=entity_type,
+                    data=json.dumps(data),
+                    updated_at=incoming_updated,
                 )
+                db.add(new_tt)
+                timetable_map[(data["id"], entity_type)] = new_tt
                 applied += 1
             elif is_resurrection(existing, incoming_deleted):
                 conflicts.append({"entity_type": entity_type, "id": data["id"], "resolution": "tombstone_kept"})

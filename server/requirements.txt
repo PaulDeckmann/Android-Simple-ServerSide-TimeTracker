@@ -3,7 +3,6 @@ uvicorn[standard]==0.37.0
 SQLAlchemy==2.0.45
 psycopg2-binary==2.9.11
 alembic==1.16.5
-passlib[bcrypt]==1.7.4
 bcrypt==4.2.1
 pydantic==2.12.4
 slowapi==0.1.9

@@ -98,18 +98,29 @@ class UrlSwitchingSyncApi(
 ) : SyncApi {
 
     private val moshiConverterFactory = MoshiConverterFactory.create(moshi)
+    private var cachedUrl: String? = null
+    private var cachedApi: SyncApi? = null
+    private val lock = Any()
 
     private fun api(): SyncApi {
         val raw = baseUrlProvider().trim()
         if (raw.isEmpty()) throw SyncNotConfiguredException()
         val normalized = SyncUrlValidator.normalizeOrNull(raw)
             ?: throw SyncInvalidUrlException(raw)
-        val retrofit = Retrofit.Builder()
-            .baseUrl(normalized)
-            .client(okHttpClient)
-            .addConverterFactory(moshiConverterFactory)
-            .build()
-        return retrofit.create(SyncApi::class.java)
+        synchronized(lock) {
+            if (cachedUrl == normalized && cachedApi != null) {
+                return cachedApi!!
+            }
+            val retrofit = Retrofit.Builder()
+                .baseUrl(normalized)
+                .client(okHttpClient)
+                .addConverterFactory(moshiConverterFactory)
+                .build()
+            val newApi = retrofit.create(SyncApi::class.java)
+            cachedUrl = normalized
+            cachedApi = newApi
+            return newApi
+        }
     }
 
     override suspend fun login(body: LoginRequest): TokenResponse = api().login(body)

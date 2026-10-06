@@ -79,6 +79,9 @@ class SyncDebugReceiver : BroadcastReceiver() {
     lateinit var addRunningRecordMediator: AddRunningRecordMediator
 
     @Inject
+    lateinit var removeRunningRecordMediator: com.example.util.simpletimetracker.domain.record.interactor.RemoveRunningRecordMediator
+
+    @Inject
     lateinit var timetableRepo: com.example.util.simpletimetracker.domain.timetable.repo.TimetableRepo
 
     @Inject
@@ -95,6 +98,9 @@ class SyncDebugReceiver : BroadcastReceiver() {
 
     @Inject
     lateinit var recordRepeatInteractor: com.example.util.simpletimetracker.core.interactor.RecordRepeatInteractor
+
+    @Inject
+    lateinit var recordTypeInteractor: com.example.util.simpletimetracker.domain.recordType.interactor.RecordTypeInteractor
 
     override fun onReceive(context: Context, intent: Intent) {
         val pending = goAsync()
@@ -153,7 +159,32 @@ class SyncDebugReceiver : BroadcastReceiver() {
                     }
                     ACTION_ADD_UNI_TEST_DATA -> addUniTestData()
                     ACTION_START_TIMER -> startTimer(intent.getStringExtra(EXTRA_NAME).orEmpty())
+                    ACTION_STOP_TIMER -> {
+                        val name = intent.getStringExtra(EXTRA_NAME)
+                        val save = intent.getBooleanExtra(EXTRA_SAVE_RECORD, true)
+                        stopTimer(name, save)
+                    }
                     ACTION_STOP_ALL_TIMERS -> stopAllTimers()
+                    ACTION_ADD_ACTIVITY -> {
+                        val name = intent.getStringExtra(EXTRA_NAME).orEmpty()
+                        val colorId = intent.getIntExtra(EXTRA_COLOR_ID, 1)
+                        val icon = intent.getStringExtra(EXTRA_ICON) ?: "ic_play_arrow_24px"
+                        if (name.isNotEmpty()) addActivity(name, colorId, icon)
+                    }
+                    ACTION_RENAME_ACTIVITY -> {
+                        val oldName = intent.getStringExtra(EXTRA_NAME).orEmpty()
+                        val newName = intent.getStringExtra(EXTRA_NEW_NAME).orEmpty()
+                        if (oldName.isNotEmpty() && newName.isNotEmpty()) renameActivity(oldName, newName)
+                    }
+                    ACTION_DELETE_RECORD -> {
+                        val name = intent.getStringExtra(EXTRA_NAME)
+                        deleteLatestRecord(name)
+                    }
+                    ACTION_DELETE_ACTIVITY -> {
+                        val name = intent.getStringExtra(EXTRA_NAME).orEmpty()
+                        if (name.isNotEmpty()) deleteActivity(name)
+                    }
+                    ACTION_DUMP_ACTIVITIES -> dumpActivities()
                     ACTION_QS_TILE_REPEAT -> qsTileRepeat()
                     ACTION_DUMP_RUNNING -> dumpRunning()
                     ACTION_DUMP_RECORDS -> dumpRecords()
@@ -170,6 +201,14 @@ class SyncDebugReceiver : BroadcastReceiver() {
                         if (eventId != 0L && date.isNotEmpty() && type != null) {
                             timetableNotificationInteractor.onTodoDone(eventId, date, type)
                             Timber.i("DebugReceiver: todo done %d %s %s", eventId, date, type)
+                        }
+                    }
+                    ACTION_SET_TODO_DONE -> {
+                        val todoId = intent.getLongExtra(EXTRA_TODO_ID, 0L)
+                        val done = intent.getBooleanExtra(EXTRA_DONE, true)
+                        if (todoId != 0L) {
+                            timetableRepo.setTodoDone(todoId, done)
+                            Timber.i("DebugReceiver: set todo id=%d done=%b", todoId, done)
                         }
                     }
                     ACTION_WIPE_ALL -> wipeAll()
@@ -452,12 +491,16 @@ class SyncDebugReceiver : BroadcastReceiver() {
     private suspend fun dumpTimetable() {
         val events = timetableRepo.getAllEvents()
         val overrides = timetableRepo.getAllOverrides()
-        Timber.i("DebugReceiver: %d timetable events, %d overrides", events.size, overrides.size)
+        val todos = timetableRepo.getAllTodos()
+        Timber.i("DebugReceiver: %d timetable events, %d overrides, %d todos", events.size, overrides.size, todos.size)
         events.forEach {
             Timber.i("  Event: id=%d %s day=%d %d..%d room=%s typeId=%s", it.id, it.name, it.dayOfWeek, it.startTime, it.endTime, it.room, it.activityTypeId)
         }
         overrides.forEach {
             Timber.i("  Override: id=%d date=%s eventId=%d room=%s %d..%d cancelled=%b", it.id, it.date, it.eventId, it.room, it.startTime, it.endTime, it.cancelled)
+        }
+        todos.forEach {
+            Timber.i("  Todo: id=%d eventId=%d date=%s text='%s' done=%b type=%s", it.id, it.eventId, it.date, it.text, it.done, it.type)
         }
     }
 
@@ -465,6 +508,87 @@ class SyncDebugReceiver : BroadcastReceiver() {
         val running = runningRecordRepo.getAll()
         running.forEach { runningRecordRepo.remove(it.id) }
         Timber.i("DebugReceiver: stopped %d timers (without records)", running.size)
+    }
+
+    private suspend fun stopTimer(name: String?, saveRecord: Boolean) {
+        val allRunning = runningRecordRepo.getAll()
+        val running = if (name.isNullOrEmpty()) {
+            allRunning
+        } else {
+            val type = recordTypeRepo.get(name).firstOrNull()
+            if (type != null) allRunning.filter { it.id == type.id } else emptyList()
+        }
+        running.forEach { r ->
+            if (saveRecord) {
+                removeRunningRecordMediator.removeWithRecordAdd(r)
+            } else {
+                runningRecordRepo.remove(r.id)
+            }
+        }
+        Timber.i("DebugReceiver: stopped %d timers (saveRecord=%b)", running.size, saveRecord)
+    }
+
+    private suspend fun addActivity(name: String, colorId: Int, icon: String) {
+        val existing = recordTypeRepo.get(name).firstOrNull()
+        if (existing == null) {
+            val id = recordTypeRepo.add(
+                RecordType(
+                    id = 0,
+                    name = name,
+                    icon = icon,
+                    color = AppColor(colorId = colorId, colorInt = ""),
+                    defaultDuration = 0,
+                    note = "",
+                ),
+            )
+            Timber.i("DebugReceiver: created activity %s (id=%d)", name, id)
+        } else {
+            Timber.i("DebugReceiver: activity %s already exists (id=%d)", name, existing.id)
+        }
+    }
+
+    private suspend fun renameActivity(oldName: String, newName: String) {
+        val existing = recordTypeRepo.get(oldName).firstOrNull()
+        if (existing != null) {
+            recordTypeRepo.add(existing.copy(name = newName))
+            Timber.i("DebugReceiver: renamed activity %s -> %s (id=%d)", oldName, newName, existing.id)
+        } else {
+            Timber.w("DebugReceiver: activity %s not found to rename", oldName)
+        }
+    }
+
+    private suspend fun deleteActivity(name: String) {
+        val existing = recordTypeRepo.get(name).firstOrNull()
+        if (existing != null) {
+            recordTypeInteractor.remove(existing.id)
+            Timber.i("DebugReceiver: deleted activity %s (id=%d)", name, existing.id)
+        } else {
+            Timber.w("DebugReceiver: activity %s not found to delete", name)
+        }
+    }
+
+    private suspend fun deleteLatestRecord(name: String?) {
+        val records = recordRepo.getAll().sortedByDescending { it.timeEnded }
+        val target = if (name.isNullOrEmpty()) {
+            records.firstOrNull()
+        } else {
+            val type = recordTypeRepo.get(name).firstOrNull()
+            if (type != null) records.firstOrNull { it.typeId == type.id } else null
+        }
+        if (target != null) {
+            recordRepo.remove(target.id)
+            Timber.i("DebugReceiver: deleted record id=%d", target.id)
+        } else {
+            Timber.w("DebugReceiver: no record found to delete")
+        }
+    }
+
+    private suspend fun dumpActivities() {
+        val types = recordTypeRepo.getAll()
+        Timber.i("DebugReceiver: %d activities:", types.size)
+        types.forEach {
+            Timber.i("  activity id=%d name='%s' color=%d icon='%s'", it.id, it.name, it.color.colorId, it.icon)
+        }
     }
 
     // Executes the quick settings tile logic for testing.
@@ -536,7 +660,13 @@ class SyncDebugReceiver : BroadcastReceiver() {
         const val ACTION_WIPE_LOCAL = "de.piusdischinger.timetracker.debug.WIPE_LOCAL"
         const val ACTION_ADD_UNI_TEST_DATA = "de.piusdischinger.timetracker.debug.ADD_UNI_TEST_DATA"
         const val ACTION_START_TIMER = "de.piusdischinger.timetracker.debug.START_TIMER"
+        const val ACTION_STOP_TIMER = "de.piusdischinger.timetracker.debug.STOP_TIMER"
         const val ACTION_STOP_ALL_TIMERS = "de.piusdischinger.timetracker.debug.STOP_ALL_TIMERS"
+        const val ACTION_ADD_ACTIVITY = "de.piusdischinger.timetracker.debug.ADD_ACTIVITY"
+        const val ACTION_RENAME_ACTIVITY = "de.piusdischinger.timetracker.debug.RENAME_ACTIVITY"
+        const val ACTION_DELETE_ACTIVITY = "de.piusdischinger.timetracker.debug.DELETE_ACTIVITY"
+        const val ACTION_DELETE_RECORD = "de.piusdischinger.timetracker.debug.DELETE_RECORD"
+        const val ACTION_DUMP_ACTIVITIES = "de.piusdischinger.timetracker.debug.DUMP_ACTIVITIES"
         const val ACTION_QS_TILE_REPEAT = "de.piusdischinger.timetracker.debug.QS_TILE_REPEAT"
         const val ACTION_DUMP_RUNNING = "de.piusdischinger.timetracker.debug.DUMP_RUNNING"
         const val ACTION_DUMP_RECORDS = "de.piusdischinger.timetracker.debug.DUMP_RECORDS"
@@ -546,6 +676,7 @@ class SyncDebugReceiver : BroadcastReceiver() {
         const val ACTION_RESCHEDULE_TIMETABLE = "de.piusdischinger.timetracker.debug.RESCHEDULE_TIMETABLE"
         const val ACTION_RESET_TIMETABLE_MIRROR = "de.piusdischinger.timetracker.debug.RESET_TIMETABLE_MIRROR"
         const val ACTION_TIMETABLE_TODO_DONE = "de.piusdischinger.timetracker.debug.TIMETABLE_TODO_DONE"
+        const val ACTION_SET_TODO_DONE = "de.piusdischinger.timetracker.debug.SET_TODO_DONE"
         const val ACTION_WIPE_ALL = "de.piusdischinger.timetracker.debug.WIPE_ALL"
         const val ACTION_SET_PREF_BOOL = "de.piusdischinger.timetracker.debug.SET_PREF_BOOL"
         const val ACTION_SET_VACATION_PERIOD =
@@ -558,11 +689,17 @@ class SyncDebugReceiver : BroadcastReceiver() {
         const val EXTRA_TOKEN = "token"
         const val EXTRA_HOST = "host"
         const val EXTRA_NAME = "name"
+        const val EXTRA_NEW_NAME = "newName"
+        const val EXTRA_COLOR_ID = "colorId"
+        const val EXTRA_ICON = "icon"
+        const val EXTRA_SAVE_RECORD = "saveRecord"
         const val EXTRA_PATH = "path"
         const val EXTRA_EVENT_ID = "eventId"
         const val EXTRA_DATE = "date"
         const val EXTRA_START = "start"
         const val EXTRA_END = "end"
         const val EXTRA_TODO_TYPE = "todoType"
+        const val EXTRA_TODO_ID = "todoId"
+        const val EXTRA_DONE = "done"
     }
 }

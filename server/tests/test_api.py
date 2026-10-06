@@ -681,3 +681,94 @@ def test_restore_deleted_time_entry_undo():
     active_ids = [e["id"] for e in list_res.json()]
     assert entry_id in active_ids
 
+
+def test_bulk_sync_push_and_pull():
+    ensure_seed_user()
+    client = TestClient(app)
+    token = login(client)
+
+    # Push 30 items in a single request (mixed activities, entries, categories, tags, timetable)
+    items = []
+    # 5 activities
+    for i in range(5):
+        items.append({
+            "entity_type": "activity",
+            "data": {
+                "id": f"bulk_act_{i}",
+                "name": f"Bulk Activity {i}",
+                "color_id": i,
+                "created_at": "2026-10-06T10:00:00Z",
+                "updated_at": "2026-10-06T10:00:00Z",
+            },
+        })
+    # 10 time entries
+    for i in range(10):
+        items.append({
+            "entity_type": "time_entry",
+            "data": {
+                "id": f"bulk_entry_{i}",
+                "activity_id": f"bulk_act_{i % 5}",
+                "started_at": f"2026-10-06T{10+i:02d}:00:00Z",
+                "ended_at": f"2026-10-06T{10+i:02d}:30:00Z",
+                "duration_seconds": 1800,
+                "comment": f"Bulk Entry {i}",
+                "created_at": "2026-10-06T10:00:00Z",
+                "updated_at": "2026-10-06T10:00:00Z",
+            },
+        })
+    # 5 categories
+    for i in range(5):
+        items.append({
+            "entity_type": "category",
+            "data": {
+                "id": f"bulk_cat_{i}",
+                "name": f"Bulk Cat {i}",
+                "color": {"colorId": i, "colorInt": ""},
+                "created_at": "2026-10-06T10:00:00Z",
+                "updated_at": "2026-10-06T10:00:00Z",
+            },
+        })
+    # 5 tags
+    for i in range(5):
+        items.append({
+            "entity_type": "record_tag",
+            "data": {
+                "id": f"bulk_tag_{i}",
+                "name": f"Bulk Tag {i}",
+                "color": {"colorId": i, "colorInt": ""},
+                "created_at": "2026-10-06T10:00:00Z",
+                "updated_at": "2026-10-06T10:00:00Z",
+            },
+        })
+    # 5 timetable events
+    for i in range(5):
+        items.append({
+            "entity_type": "timetable_event",
+            "data": {
+                "id": f"bulk_evt_{i}",
+                "name": f"Bulk Event {i}",
+                "day_of_week": (i % 7) + 1,
+                "start_time": 480 + i * 60,
+                "end_time": 540 + i * 60,
+                "created_at": "2026-10-06T10:00:00Z",
+                "updated_at": "2026-10-06T10:00:00Z",
+            },
+        })
+
+    push_res = client.post("/api/sync/push", json={"items": items}, headers=auth_headers(token))
+    assert push_res.status_code == 200, push_res.text
+    push_data = push_res.json()
+    assert push_data["applied"] == 30
+    assert len(push_data["conflicts"]) == 0
+
+    # Test incremental delta pull with since
+    pull_res = client.get("/api/sync/pull?since=2026-10-06T09:00:00Z", headers=auth_headers(token))
+    assert pull_res.status_code == 200
+    pull_data = pull_res.json()
+    assert len(pull_data["activities"]) >= 5
+    assert len(pull_data["time_entries"]) >= 10
+    assert len(pull_data["categories"]) >= 5
+    assert len(pull_data["tags"]) >= 5
+    assert len(pull_data["timetable_events"]) >= 5
+
+

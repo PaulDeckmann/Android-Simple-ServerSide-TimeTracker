@@ -7,21 +7,25 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Request, Response
-from passlib.context import CryptContext
 from sqlalchemy.orm import Session
+import bcrypt
 
 from app.config import Config
 from app.db import ApiToken, RefreshToken, SessionLocal, User, new_id, utcnow
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    pwd_bytes = password.encode("utf-8")[:72]
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(pwd_bytes, salt).decode("utf-8")
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return pwd_context.verify(password, password_hash)
+    pwd_bytes = password.encode("utf-8")[:72]
+    try:
+        return bcrypt.checkpw(pwd_bytes, password_hash.encode("utf-8"))
+    except Exception:
+        return False
 
 
 def get_secret_key() -> str:
