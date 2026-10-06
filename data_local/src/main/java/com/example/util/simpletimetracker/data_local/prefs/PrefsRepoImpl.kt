@@ -346,7 +346,7 @@ class PrefsRepoImpl @Inject constructor(
     )
 
     override var ignoreShortRecordsDuration: Long by prefs.delegate(
-        KEY_IGNORE_SHORT_RECORDS_DURATION, 0, // 0 is for disabled
+        KEY_IGNORE_SHORT_RECORDS_DURATION, 60, // default 60s (1 min)
     )
 
     override var ignoreShortUntrackedDuration: Long by prefs.delegate(

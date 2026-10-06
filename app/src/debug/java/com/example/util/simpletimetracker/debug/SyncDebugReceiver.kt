@@ -52,7 +52,13 @@ class SyncDebugReceiver : BroadcastReceiver() {
     lateinit var syncScheduler: SyncScheduler
 
     @Inject
+    lateinit var syncEngine: com.example.util.simpletimetracker.data_sync.engine.SyncEngine
+
+    @Inject
     lateinit var recordRepo: RecordRepo
+
+    @Inject
+    lateinit var recordInteractor: com.example.util.simpletimetracker.domain.record.interactor.RecordInteractor
 
     @Inject
     lateinit var runningRecordRepo: RunningRecordRepo
@@ -108,8 +114,8 @@ class SyncDebugReceiver : BroadcastReceiver() {
             try {
                 when (intent.action) {
                     ACTION_SYNC_NOW -> {
-                        Timber.i("DebugReceiver: sync requested")
-                        syncScheduler.syncNow()
+                        Timber.i("DebugReceiver: direct sync requested")
+                        syncEngine.syncNow()
                     }
                     ACTION_DUMP_STATE -> dumpState()
                     ACTION_DNS_TEST -> {
@@ -180,6 +186,17 @@ class SyncDebugReceiver : BroadcastReceiver() {
                         val name = intent.getStringExtra(EXTRA_NAME)
                         deleteLatestRecord(name)
                     }
+                    ACTION_ADD_RECORD -> {
+                        val name = intent.getStringExtra(EXTRA_NAME).orEmpty()
+                        val durSec = intent.getLongExtra("durSec", 0L)
+                        val now = System.currentTimeMillis()
+                        val start = now - durSec * 1000L
+                        val type = recordTypeRepo.get(name).firstOrNull()
+                        if (type != null) {
+                            recordInteractor.add(Record(id = 0, typeId = type.id, timeStarted = start, timeEnded = now, comment = "test", tags = emptyList()))
+                            Timber.i("DebugReceiver: add record for %s with durSec=%d", name, durSec)
+                        }
+                    }
                     ACTION_DELETE_ACTIVITY -> {
                         val name = intent.getStringExtra(EXTRA_NAME).orEmpty()
                         if (name.isNotEmpty()) deleteActivity(name)
@@ -212,6 +229,7 @@ class SyncDebugReceiver : BroadcastReceiver() {
                         }
                     }
                     ACTION_WIPE_ALL -> wipeAll()
+                    ACTION_PRUNE_SHORT_RECORDS -> pruneShortRecords()
                     ACTION_SET_PREF_LONG -> {
                         val key = intent.getStringExtra(EXTRA_KEY).orEmpty()
                         val value = intent.getLongExtra(EXTRA_VALUE, 0L)
@@ -608,13 +626,22 @@ class SyncDebugReceiver : BroadcastReceiver() {
         }
     }
 
+    private suspend fun pruneShortRecords() {
+        val short = recordRepo.getAll().filter { it.timeEnded > 0 && (it.timeEnded - it.timeStarted) < 60_000L }
+        short.forEach { r ->
+            recordRepo.remove(r.id)
+            Timber.i("DebugReceiver: pruned short record id=%d (duration=%d ms)", r.id, r.timeEnded - r.timeStarted)
+        }
+        Timber.i("DebugReceiver: pruned %d short records", short.size)
+    }
+
     private suspend fun dumpRecords() {
-        val records = recordRepo.getAll().sortedByDescending { it.timeEnded }.take(5)
+        val records = recordRepo.getAll().sortedByDescending { it.timeEnded }.take(10)
         Timber.i("DebugReceiver: latest %d records:", records.size)
         records.forEach { r ->
             val name = recordTypeRepo.get(r.typeId)?.name ?: "?"
-            val durMin = (r.timeEnded - r.timeStarted) / 60000
-            Timber.i("  record '%s' start=%d end=%d (%d min)", name, r.timeStarted, r.timeEnded, durMin)
+            val durSec = (r.timeEnded - r.timeStarted) / 1000
+            Timber.i("  record id=%d '%s' start=%d end=%d (%d s / %d min)", r.id, name, r.timeStarted, r.timeEnded, durSec, durSec / 60)
         }
     }
 
@@ -666,6 +693,7 @@ class SyncDebugReceiver : BroadcastReceiver() {
         const val ACTION_RENAME_ACTIVITY = "de.piusdischinger.timetracker.debug.RENAME_ACTIVITY"
         const val ACTION_DELETE_ACTIVITY = "de.piusdischinger.timetracker.debug.DELETE_ACTIVITY"
         const val ACTION_DELETE_RECORD = "de.piusdischinger.timetracker.debug.DELETE_RECORD"
+        const val ACTION_ADD_RECORD = "de.piusdischinger.timetracker.debug.ADD_RECORD"
         const val ACTION_DUMP_ACTIVITIES = "de.piusdischinger.timetracker.debug.DUMP_ACTIVITIES"
         const val ACTION_QS_TILE_REPEAT = "de.piusdischinger.timetracker.debug.QS_TILE_REPEAT"
         const val ACTION_DUMP_RUNNING = "de.piusdischinger.timetracker.debug.DUMP_RUNNING"
@@ -678,6 +706,7 @@ class SyncDebugReceiver : BroadcastReceiver() {
         const val ACTION_TIMETABLE_TODO_DONE = "de.piusdischinger.timetracker.debug.TIMETABLE_TODO_DONE"
         const val ACTION_SET_TODO_DONE = "de.piusdischinger.timetracker.debug.SET_TODO_DONE"
         const val ACTION_WIPE_ALL = "de.piusdischinger.timetracker.debug.WIPE_ALL"
+        const val ACTION_PRUNE_SHORT_RECORDS = "de.piusdischinger.timetracker.debug.PRUNE_SHORT_RECORDS"
         const val ACTION_SET_PREF_BOOL = "de.piusdischinger.timetracker.debug.SET_PREF_BOOL"
         const val ACTION_SET_VACATION_PERIOD =
             "de.piusdischinger.timetracker.debug.SET_VACATION_PERIOD"

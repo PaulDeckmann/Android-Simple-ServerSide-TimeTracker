@@ -1266,6 +1266,19 @@ async function stopTimer() {
       throw new Error(res.status + " " + text);
     }
     const data = await res.json();
+    if (data.stopped) {
+      const dur = data.stopped.duration_seconds != null ? data.stopped.duration_seconds :
+        Math.floor((new Date(data.stopped.ended_at) - new Date(data.stopped.started_at)) / 1000);
+      if (dur < 60) {
+        try {
+          await fetch("/api/time-entries/" + encodeURIComponent(data.stopped.id), {
+            method: "DELETE",
+            headers: { Authorization: "Bearer " + token }
+          });
+        } catch (_) {}
+        data.stopped = null;
+      }
+    }
     renderTimerState(data);
     if (DATA) load();
   } catch (err) {
@@ -1289,6 +1302,17 @@ async function fallbackStopTimer(token) {
   const now = new Date();
   const s = new Date(entry.started_at);
   const dur = Math.max(0, Math.floor((now - s) / 1000));
+  if (dur < 60) {
+    try {
+      await fetch("/api/time-entries/" + encodeURIComponent(entry.id), {
+        method: "DELETE",
+        headers: { Authorization: "Bearer " + token }
+      });
+    } catch (_) {}
+    renderTimerState({running: false, entry: null});
+    if (DATA) load();
+    return;
+  }
   const patchBody = {
     activity_id: entry.activity_id,
     parent_activity_ids: entry.parent_activity_ids || "",
@@ -2450,7 +2474,16 @@ async function load() {
   }
 }
 
-const active = (list) => (list || []).filter((x) => !x.deleted_at);
+const active = (list) => (list || []).filter((x) => {
+  if (x.deleted_at) return false;
+  // Ignore finished time entries shorter than 1 minute (60s)
+  if (x.started_at && x.ended_at) {
+    const durSec = x.duration_seconds != null ? x.duration_seconds :
+      ((new Date(x.ended_at) - new Date(x.started_at)) / 1000);
+    if (durSec < 60) return false;
+  }
+  return true;
+});
 
 function localDateStr(date) {
   const y = date.getFullYear();
@@ -3470,6 +3503,10 @@ async function submitManualAttendance() {
   }
 
   const dur = Math.max(0, Math.round((new Date(endedAt) - new Date(startedAt)) / 1000));
+  if (dur < 60) {
+    if (errEl) { errEl.textContent = "Aufzeichnungen unter 1 Minute werden ignoriert."; errEl.classList.remove("hide"); }
+    return;
+  }
   const body = {
     activity_id: actId,
     started_at: startedAt,

@@ -90,6 +90,12 @@ class RecordInteractor @Inject constructor(
     }
 
     suspend fun add(record: Record) {
+        if (record.timeEnded > 0 && (record.timeEnded - record.timeStarted) < MIN_RECORD_DURATION_MILLIS) {
+            if (record.id != 0L) {
+                recordRepo.remove(record.id)
+            }
+            return
+        }
         recordRepo.add(record)
     }
 
@@ -108,6 +114,11 @@ class RecordInteractor @Inject constructor(
     }
 
     suspend fun updateTimeEnded(recordId: Long, timeEnded: Long) {
+        val record = recordRepo.get(recordId)
+        if (record != null && timeEnded > 0 && (timeEnded - record.timeStarted) < MIN_RECORD_DURATION_MILLIS) {
+            recordRepo.remove(recordId)
+            return
+        }
         recordRepo.updateTimeEnded(
             recordId = recordId,
             timeEnded = timeEnded,
@@ -132,5 +143,9 @@ class RecordInteractor @Inject constructor(
         data object Untagged : GetParam
         data class FromRange(val range: Range) : GetParam
         data class FromRangeByType(val ids: Set<Long>, val range: Range) : GetParam
+    }
+
+    companion object {
+        const val MIN_RECORD_DURATION_MILLIS = 60_000L
     }
 }

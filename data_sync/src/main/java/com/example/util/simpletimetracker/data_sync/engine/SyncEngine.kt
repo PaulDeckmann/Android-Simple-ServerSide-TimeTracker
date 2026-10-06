@@ -181,6 +181,14 @@ class SyncEngine @Inject constructor(
     suspend fun getConflictsCount(): Int = syncConflictDao.count()
 
     private suspend fun pushLocalChanges() {
+        // Prune any records shorter than 1 minute (60s) from local database so they are ignored and tombstoned on server
+        recordRepo.getAll()
+            .filter { it.timeEnded > 0 && (it.timeEnded - it.timeStarted) < MIN_RECORD_DURATION_MILLIS }
+            .forEach { shortRecord ->
+                Timber.i("Pruning short record %d (< 60s) from local DB", shortRecord.id)
+                recordRepo.remove(shortRecord.id)
+            }
+
         val mappings = loadMappings()
         val candidates = buildCandidates(mappings)
         val mirror = syncStateDao.getAll().associate {
@@ -306,7 +314,9 @@ class SyncEngine @Inject constructor(
                 payload = type.toPayloadContent(syncId, categorySyncIds),
             )
         }
-        val recordCandidates = recordRepo.getAll().mapNotNull { record ->
+        val recordCandidates = recordRepo.getAll()
+            .filter { (it.timeEnded - it.timeStarted) >= MIN_RECORD_DURATION_MILLIS }
+            .mapNotNull { record ->
             val syncId = mappings.syncIdOf(ENTITY_TIME_ENTRY, record.id)
             val typeSyncId = mappings.existingSyncId(ENTITY_ACTIVITY, record.typeId)
                 ?: return@mapNotNull null.also {
@@ -1128,6 +1138,13 @@ class SyncEngine @Inject constructor(
             Timber.w("Skipping time entry %s: unparsable activity id or timestamps", entry.id)
             return
         }
+        if (parsed.timeEnded > 0 && (parsed.timeEnded - parsed.timeStarted) < MIN_RECORD_DURATION_MILLIS) {
+            Timber.i("Removing local time entry %d: duration is < 60s from sync", localId)
+            recordRepo.remove(localId)
+            mappings.forget(ENTITY_TIME_ENTRY, entry.id)
+            syncStateDao.remove(ENTITY_TIME_ENTRY, entry.id)
+            return
+        }
         val serverTypeId = mappings.localIdOf(ENTITY_ACTIVITY, entry.activity_id)
             ?: run {
                 Timber.w("Skipping time entry %s: unknown activity %s", entry.id, entry.activity_id)
@@ -1160,6 +1177,10 @@ class SyncEngine @Inject constructor(
         }
         val parsed = entry.toParsed() ?: run {
             Timber.w("Skipping time entry %s: unparsable activity id or timestamps", entry.id)
+            return
+        }
+        if (parsed.timeEnded > 0 && (parsed.timeEnded - parsed.timeStarted) < MIN_RECORD_DURATION_MILLIS) {
+            Timber.i("Skipping import of time entry %s: duration is < 60s", entry.id)
             return
         }
         Timber.i("Importing time entry %s from sync", entry.id)
@@ -1634,6 +1655,7 @@ class SyncEngine @Inject constructor(
         private const val CONFLICT_UNKNOWN_TYPE = "unknown_type"
         private const val RESOLUTION_LOCAL_KEPT_NAME = "local_kept_name"
         private const val RESOLUTION_LOCAL_KEPT_START = "local_kept_start_time"
+        private const val MIN_RECORD_DURATION_MILLIS = 60_000L
 
         private fun nowIso(): String = DateTimeFormatter.ISO_INSTANT.format(Instant.now())
         private fun format(epochMilli: Long): String =

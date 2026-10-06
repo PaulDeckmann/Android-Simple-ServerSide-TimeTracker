@@ -38,11 +38,11 @@ class RemoveRunningRecordMediator @Inject constructor(
         val recordTimeEnded = timeEnded
             ?.coerceAtLeast(runningRecord.timeStarted)
             ?: System.currentTimeMillis()
-        val durationToIgnore = prefsInteractor.getIgnoreShortRecordsDuration()
+        val durationToIgnore = maxOf(MIN_RECORD_DURATION_SECONDS, prefsInteractor.getIgnoreShortRecordsDuration())
         val duration = TimeUnit.MILLISECONDS
             .toSeconds(recordTimeEnded - runningRecord.timeStarted)
 
-        val recordWasSaved = duration > durationToIgnore || durationToIgnore == 0L
+        val recordWasSaved = duration >= durationToIgnore
         if (recordWasSaved) {
             // No need to update widgets and notification because it will be done in running record remove.
             recordInteractor.addFromRunning(
@@ -100,5 +100,9 @@ class RemoveRunningRecordMediator @Inject constructor(
             lifecycleEvent = lifecycleEvent,
         )
         if (checkPomodoroStop) pomodoroStopInteractor.checkAndStop(typeId)
+    }
+
+    private companion object {
+        private const val MIN_RECORD_DURATION_SECONDS = 60L
     }
 }
