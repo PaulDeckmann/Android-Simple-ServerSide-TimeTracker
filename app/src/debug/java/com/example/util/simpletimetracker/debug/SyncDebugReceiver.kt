@@ -229,6 +229,7 @@ class SyncDebugReceiver : BroadcastReceiver() {
                         }
                     }
                     ACTION_WIPE_ALL -> wipeAll()
+                    ACTION_RESET_CLEAN_DATASET -> resetCleanDataset()
                     ACTION_PRUNE_SHORT_RECORDS -> pruneShortRecords()
                     ACTION_SET_PREF_LONG -> {
                         val key = intent.getStringExtra(EXTRA_KEY).orEmpty()
@@ -663,13 +664,61 @@ class SyncDebugReceiver : BroadcastReceiver() {
         Timber.i("DebugReceiver: uni category id=%d types=%s", categoryId, typeIds)
     }
 
+    private suspend fun resetCleanDataset() {
+        Timber.i("DebugReceiver: starting resetCleanDataset...")
+        // 1. Stop any running timers
+        val running = runningRecordRepo.getAll()
+        running.forEach { runningRecordRepo.remove(it.id) }
+        Timber.i("DebugReceiver: stopped %d running timers", running.size)
+
+        // 2. Remove all records locally so tombstones are generated
+        val allRecords = recordRepo.getAll()
+        allRecords.forEach { recordRepo.remove(it.id) }
+        Timber.i("DebugReceiver: removed %d local records", allRecords.size)
+
+        // 3. Clear timetable and subject goals
+        timetableRepo.clearAll()
+        subjectGoalRepo.clear()
+        Timber.i("DebugReceiver: cleared timetable and subject goals")
+
+        // 4. Sync to push tombstones for old records and timetable to server
+        runCatching { syncEngine.syncNow() }
+            .onSuccess { Timber.i("DebugReceiver: tombstones pushed to server") }
+            .onFailure { Timber.e(it, "DebugReceiver: failed to push tombstones") }
+
+        // 5. Seed the clean timetable, activities, category, and 10 attendance records
+        seedTimetable()
+
+        // 6. Set clean subject goals (75h / 2.5 ECTS for the 4 Uni subjects)
+        val uniSubjects = listOf("Thermodynamik", "Analysis", "Java", "TheoInfo")
+        uniSubjects.forEach { name ->
+            val type = recordTypeRepo.get(name).firstOrNull()
+            if (type != null) {
+                subjectGoalRepo.set(
+                    com.example.util.simpletimetracker.domain.timetable.model.SubjectGoal(
+                        activityTypeId = type.id,
+                        targetSeconds = 75L * 3600L,
+                        ects = 2.5,
+                    ),
+                )
+            }
+        }
+        Timber.i("DebugReceiver: configured subject goals for uni subjects")
+
+        // 7. Sync new clean dataset to server
+        runCatching { syncEngine.syncNow() }
+            .onSuccess { Timber.i("DebugReceiver: clean dataset synced successfully to server") }
+            .onFailure { Timber.e(it, "DebugReceiver: failed to sync clean dataset") }
+    }
+
     private suspend fun dumpState() {
         val mirror = syncStateDao.getAll()
         val mappings = syncIdMapDao.getAll()
         Timber.i(
-            "DebugReceiver state: url=%s user=%s marker=%s mirrorEntries=%d idMappings=%d",
+            "DebugReceiver state: url=%s user=%s token=%s marker=%s mirrorEntries=%d idMappings=%d",
             credentialStore.serverUrl,
             credentialStore.username,
+            credentialStore.apiToken,
             credentialStore.lastSyncMarker,
             mirror.size,
             mappings.size,
@@ -694,6 +743,7 @@ class SyncDebugReceiver : BroadcastReceiver() {
         const val ACTION_DELETE_ACTIVITY = "de.piusdischinger.timetracker.debug.DELETE_ACTIVITY"
         const val ACTION_DELETE_RECORD = "de.piusdischinger.timetracker.debug.DELETE_RECORD"
         const val ACTION_ADD_RECORD = "de.piusdischinger.timetracker.debug.ADD_RECORD"
+        const val ACTION_RESET_CLEAN_DATASET = "de.piusdischinger.timetracker.debug.RESET_CLEAN_DATASET"
         const val ACTION_DUMP_ACTIVITIES = "de.piusdischinger.timetracker.debug.DUMP_ACTIVITIES"
         const val ACTION_QS_TILE_REPEAT = "de.piusdischinger.timetracker.debug.QS_TILE_REPEAT"
         const val ACTION_DUMP_RUNNING = "de.piusdischinger.timetracker.debug.DUMP_RUNNING"
